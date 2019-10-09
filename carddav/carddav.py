@@ -41,7 +41,7 @@ contains the class PyCardDAV and some associated functions and definitions
 from collections import namedtuple
 import requests
 import sys
-import urlparse
+from urllib.parse import urlparse, urljoin
 import logging
 import lxml.etree as ET
 import string
@@ -56,7 +56,7 @@ def get_random_href():
     """returns a random href"""
     import random
     tmp_list = list()
-    for _ in xrange(3):
+    for _ in range(3):
         rand_number = random.randint(0, 0x100000000)
         tmp_list.append("{0:x}".format(rand_number))
     return "-".join(tmp_list).upper()
@@ -95,8 +95,8 @@ class PyCardDAV(object):
         #shutup url3
         urllog = logging.getLogger('requests.packages.urllib3.connectionpool')
         urllog.setLevel(logging.CRITICAL)
-
-        split_url = urlparse.urlparse(resource)
+        self.user = user
+        split_url = urlparse(resource)
         url_tuple = namedtuple('url', 'resource base path')
         self.url = url_tuple(resource,
                              split_url.scheme + '://' + split_url.netloc,
@@ -122,10 +122,10 @@ class PyCardDAV(object):
         """gets verify from settings dict"""
         return self._settings['verify']
 
-    @verify.setter
-    def verify(self, verify):
-        """set verify"""
-        self._settings['verify'] = verify
+    #@verify.setter_get_xml_props
+    #def verify(self, verify):
+    #    """set verify"""
+    #    self._settings['verify'] = verify
 
     @property
     def headers(self):
@@ -138,6 +138,47 @@ class PyCardDAV(object):
                              "the documentation.\n")
             sys.exit(1)
 
+    def delete_abook(self, href, etag=None):
+        remotepath = str(self.url.base + href)
+        headers = self.headers
+        headers['content-type'] = 'text/vcard'
+        if etag is not None:
+            headers['If-Match'] = etag
+        result = self.session.delete(remotepath,
+                                     headers=headers,
+                                     **self._settings)
+        raise_for_status( result )
+
+    def create_abook(self, name, description, href):
+        url = urljoin(self.url.base, self.user+"/")
+        if not href:
+            href = get_random_href()
+        url = urljoin(url, href)
+        self.session.request(
+            "MKCOL",
+            url,
+            data=f"""\
+<?xml version="1.0" encoding="UTF-8" ?>
+<create
+        xmlns="DAV:"
+        xmlns:C="urn:ietf:params:xml:ns:caldav"
+        xmlns:CR="urn:ietf:params:xml:ns:carddav"
+        xmlns:I="http://apple.com/ns/ical/"
+        xmlns:INF="http://inf-it.com/ns/ab/">
+        <set>
+                <prop>
+                        <resourcetype>
+                                <collection />
+                                <CR:addressbook />
+                        </resourcetype>
+                        <displayname>{name}</displayname>
+                        <INF:addressbook-color>#ba4a53ff</INF:addressbook-color>
+                        <CR:addressbook-description>{description}</CR:addressbook-description>
+                </prop>
+        </set>
+</create>
+""".encode('utf-8'),
+        )
     def _detect_server(self):
         """detects CardDAV server type
 
@@ -146,7 +187,7 @@ class PyCardDAV(object):
         """
         response = requests.request('OPTIONS',
                                     self.url.base,
-                                    headers=self.header)
+                                    headers=self.headers)
         if "X-Sabre-Version" in response.headers:
             server = SABREDAV
         elif "X-DAViCal-Version" in response.headers:
@@ -156,14 +197,23 @@ class PyCardDAV(object):
         logging.info(server + " detected")
         return server
 
-    def get_abook(self):
+
+    def get_abook(self, href=None):
         """does the propfind and processes what it returns
 
         :rtype: list of hrefs to vcards
         """
-        xml = self._get_xml_props()
+        xml = self._get_xml_props(href=href)
         abook = self._process_xml_props(xml)
         return abook
+
+    def find_vcard(self, text, abook_href=None):
+        matched = []
+        for vcard_href in self.get_abook(href=abook_href):
+            if self.get_vcard(vcard_href).find(text):
+                matched.append(vcard_href)
+        return matched
+
 
     def get_vcard(self, href):
         """
@@ -216,9 +266,9 @@ class PyCardDAV(object):
         result = self.session.delete(remotepath,
                                      headers=headers,
                                      **self._settings)
-        raise_for_status( response )
+        raise_for_status( result )
 
-    def upload_new_card(self, card):
+    def upload_new_card(self, card, abook_href=None):
         """
         upload new card to the server
 
@@ -227,18 +277,19 @@ class PyCardDAV(object):
         :rtype: tuple of string (path of the vcard on the server) and etag of
                 new card (string or None)
         """
+        url = urljoin(self.url.base, abook_href) if abook_href else  self.url.resource
         self._check_write_support()
         card = card.encode('utf-8')
         for _ in range(0, 5):
             rand_string = get_random_href()
-            remotepath = str(self.url.resource + rand_string + ".vcf")
+            remotepath = urljoin(url ,  rand_string + ".vcf")
             headers = self.headers
             headers['content-type'] = 'text/vcard'
             headers['If-None-Match'] = '*'
             response = requests.put(remotepath, data=card, headers=headers,
                                     **self._settings)
             if response.ok:
-                parsed_url = urlparse.urlparse(remotepath)
+                parsed_url = urlparse(remotepath)
 
                 if 'etag' not in response.headers:
                     etag = ''
@@ -248,7 +299,7 @@ class PyCardDAV(object):
                 return (parsed_url.path, etag)
         raise_for_status( response )
 
-    def _get_xml_props(self):
+    def list_abooks(self):
         """PROPFIND method
 
         gets the xml file with all vcard hrefs
@@ -258,7 +309,26 @@ class PyCardDAV(object):
         headers = self.headers
         headers['Depth'] = '1'
         response = self.session.request('PROPFIND',
-                                        self.url.resource,
+                                        "{url}/{user}/".format(url=self.url.base, user=self.user),
+                                        headers=headers,
+                                        **self._settings)
+        raise_for_status( response )
+        if response.headers['DAV'].count('addressbook') == 0:
+            raise Exception("URL is not a CardDAV resource")
+        books = self._process_xml_props(response.content)
+        return books
+    def _get_xml_props(self, href=None):
+        """PROPFIND method
+
+        gets the xml file with all vcard hrefs
+
+        :rtype: str() (an xml file)
+        """
+        headers = self.headers
+        headers['Depth'] = '1'
+        url = urljoin(self.url.base, href) if href else self.url.resource
+        response = self.session.request('PROPFIND',
+                                        url,
                                         headers=headers,
                                         **self._settings)
         raise_for_status( response )
@@ -275,7 +345,7 @@ class PyCardDAV(object):
         :type xml: str()
         :rtype: dict() key: href, value: etag
         """
-        xml = string.replace( xml, '<?xml version="1.0" encoding="utf-8"?>', '', 1 )
+        xml = xml.replace(b'<?xml version="1.0" encoding="utf-8"?>', b'', 1 )
         namespace = "{DAV:}"
 
         element = ET.XML(xml)
@@ -288,16 +358,19 @@ class PyCardDAV(object):
                 for refprop in response.iterchildren():
                     if (refprop.tag == namespace + "href"):
                         href = refprop.text
+                        # if not href.endswith(".vcf"):
+                        #     break
                     for prop in refprop.iterchildren():
                         for props in prop.iterchildren():
                             if (props.tag == namespace + "getcontenttype" and
                                 (props.text == "text/vcard" or
-                                 props.text == "text/vcard; charset=utf-8" or
+                                 props.text == "text/vcard;charset=utf-8" or
                                  props.text == "text/x-vcard" or
-                                 props.text == "text/x-vcard; charset=utf-8")):
+                                 props.text == "text/x-vcard;charset=utf-8")):
                                 insert = True
                             if (props.tag == namespace + "getetag"):
                                 etag = props.text
                         if insert:
                             abook[href] = etag
         return abook
+
